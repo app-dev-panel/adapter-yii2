@@ -14,6 +14,7 @@ use AppDevPanel\Adapter\Yii2\Inspector\NullSchemaProvider;
 use AppDevPanel\Adapter\Yii2\Inspector\Yii2ConfigProvider;
 use AppDevPanel\Adapter\Yii2\Inspector\Yii2DbSchemaProvider;
 use AppDevPanel\Adapter\Yii2\Inspector\Yii2RouteCollection;
+use AppDevPanel\Adapter\Yii2\Inspector\Yii2UrlMatcherAdapter;
 use AppDevPanel\Adapter\Yii2\Proxy\I18NProxy;
 use AppDevPanel\Adapter\Yii2\Proxy\RouterMatchRecorder;
 use AppDevPanel\Adapter\Yii2\Proxy\UrlRuleProxy;
@@ -52,17 +53,22 @@ use AppDevPanel\Api\Mcp\Controller\McpSettingsController;
 use AppDevPanel\Api\Mcp\McpSettings;
 use AppDevPanel\Api\Middleware\IpFilterMiddleware;
 use AppDevPanel\Api\NullPathMapper;
+use AppDevPanel\Api\Panel\PanelConfig;
+use AppDevPanel\Api\Panel\PanelController;
 use AppDevPanel\Api\PathMapper;
 use AppDevPanel\Api\PathMapperInterface;
 use AppDevPanel\Api\PathResolver;
 use AppDevPanel\Api\PathResolverInterface;
 use AppDevPanel\Kernel\Collector\AssetBundleCollector;
+use AppDevPanel\Kernel\Collector\AuthorizationCollector;
 use AppDevPanel\Kernel\Collector\CacheCollector;
+use AppDevPanel\Kernel\Collector\CodeCoverageCollector;
 use AppDevPanel\Kernel\Collector\CollectorInterface;
 use AppDevPanel\Kernel\Collector\Console\CommandCollector;
 use AppDevPanel\Kernel\Collector\Console\ConsoleAppInfoCollector;
 use AppDevPanel\Kernel\Collector\DatabaseCollector;
 use AppDevPanel\Kernel\Collector\DeprecationCollector;
+use AppDevPanel\Kernel\Collector\ElasticsearchCollector;
 use AppDevPanel\Kernel\Collector\EnvironmentCollector;
 use AppDevPanel\Kernel\Collector\EventCollector;
 use AppDevPanel\Kernel\Collector\ExceptionCollector;
@@ -72,11 +78,12 @@ use AppDevPanel\Kernel\Collector\LogCollector;
 use AppDevPanel\Kernel\Collector\MailerCollector;
 use AppDevPanel\Kernel\Collector\OpenTelemetryCollector;
 use AppDevPanel\Kernel\Collector\QueueCollector;
+use AppDevPanel\Kernel\Collector\RedisCollector;
 use AppDevPanel\Kernel\Collector\RouterCollector;
-use AppDevPanel\Kernel\Collector\AuthorizationCollector;
 use AppDevPanel\Kernel\Collector\ServiceCollector;
 use AppDevPanel\Kernel\Collector\Stream\FilesystemStreamCollector;
 use AppDevPanel\Kernel\Collector\Stream\HttpStreamCollector;
+use AppDevPanel\Kernel\Collector\TemplateCollector;
 use AppDevPanel\Kernel\Collector\TimelineCollector;
 use AppDevPanel\Kernel\Collector\TranslatorCollector;
 use AppDevPanel\Kernel\Collector\ValidatorCollector;
@@ -153,12 +160,16 @@ class Module extends \yii\base\Module implements BootstrapInterface
         'queue' => true,
         'validator' => true,
         'translator' => true,
+        'redis' => true,
+        'elasticsearch' => true,
+        'template' => true,
+        'code_coverage' => false,
     ];
 
     /**
      * @var string[] URL patterns to ignore (wildcard).
      */
-    public array $ignoredRequests = ['/debug/api/**', '/inspect/api/**'];
+    public array $ignoredRequests = ['/debug/**', '/inspect/**'];
 
     /**
      * @var string[] Command name patterns to ignore (wildcard).
@@ -186,6 +197,12 @@ class Module extends \yii\base\Module implements BootstrapInterface
      *                            Example: ['/app' => '/home/user/project']
      */
     public array $pathMapping = [];
+
+    /**
+     * @var string Base URL for panel static assets (empty = GitHub Pages default).
+     *             Use http://localhost:3000 for Vite dev server with HMR.
+     */
+    public string $panelStaticUrl = '';
 
     public $controllerNamespace = 'AppDevPanel\\Adapter\\Yii2\\Controller';
 
@@ -284,12 +301,15 @@ class Module extends \yii\base\Module implements BootstrapInterface
             \Yii::$container->setSingleton(ClientInterface::class, static fn() => new Client(['timeout' => 10]));
         }
 
-        $basePath = \Yii::getAlias('@app');
+        // Find the real project root via Composer's ClassLoader location.
+        // Yii 2's @vendor alias may point to @app/vendor (basePath/vendor),
+        // which is wrong when basePath is a subdirectory (e.g., src/).
+        $rootPath = dirname(new \ReflectionClass(\Composer\Autoload\ClassLoader::class)->getFileName(), 3);
         $runtimePath = \Yii::getAlias('@runtime');
 
         \Yii::$container->setSingleton(
             PathResolverInterface::class,
-            static fn() => new PathResolver($basePath, $runtimePath),
+            static fn() => new PathResolver($rootPath, $runtimePath),
         );
 
         $pathMapping = $this->pathMapping;
@@ -394,6 +414,34 @@ class Module extends \yii\base\Module implements BootstrapInterface
 
     private function registerApiApplication(\Psr\Container\ContainerInterface $containerBridge): void
     {
+        $panelStaticUrl = $this->panelStaticUrl;
+        if ($panelStaticUrl === '') {
+            // Auto-detect: if built assets exist in adapter package, publish them
+            $adapterDist = \dirname(__DIR__) . '/resources/dist/bundle.js';
+            if (file_exists($adapterDist)) {
+                $webroot = \Yii::getAlias('@webroot');
+                $targetDir = $webroot . '/app-dev-panel';
+                if (!is_dir($targetDir)) {
+                    @symlink(\dirname($adapterDist), $targetDir);
+                }
+                if (is_dir($targetDir)) {
+                    $panelStaticUrl = '/app-dev-panel';
+                }
+            }
+        }
+        \Yii::$container->setSingleton(
+            PanelConfig::class,
+            static fn() => new PanelConfig($panelStaticUrl !== '' ? $panelStaticUrl : PanelConfig::DEFAULT_STATIC_URL),
+        );
+        \Yii::$container->setSingleton(
+            PanelController::class,
+            static fn() => new PanelController(
+                \Yii::$container->get(ResponseFactoryInterface::class),
+                \Yii::$container->get(StreamFactoryInterface::class),
+                \Yii::$container->get(PanelConfig::class),
+            ),
+        );
+
         \Yii::$container->setSingleton(ApiApplication::class, static function () use ($containerBridge) {
             return new ApiApplication(
                 $containerBridge,
@@ -408,7 +456,7 @@ class Module extends \yii\base\Module implements BootstrapInterface
         \Psr\Container\ContainerInterface $containerBridge,
     ): void {
         // Inspector controllers — explicit registration to avoid auto-wiring issues.
-        // Each adapter must register these (same pattern as Yiisoft/Symfony adapters).
+        // Each adapter must register these (same pattern as Yii3/Symfony adapters).
         \Yii::$container->setSingleton(
             FileController::class,
             static fn() => new FileController(
@@ -427,11 +475,13 @@ class Module extends \yii\base\Module implements BootstrapInterface
         );
 
         $routeCollection = $app instanceof WebApplication ? new Yii2RouteCollection($app->getUrlManager()) : null;
+        $urlMatcher = $app instanceof WebApplication ? new Yii2UrlMatcherAdapter($app->getUrlManager()) : null;
         \Yii::$container->setSingleton(
             RoutingController::class,
             static fn() => new RoutingController(
                 \Yii::$container->get(JsonResponseFactoryInterface::class),
                 $routeCollection,
+                $urlMatcher,
             ),
         );
 
@@ -625,6 +675,10 @@ class Module extends \yii\base\Module implements BootstrapInterface
             'translator' => static fn(): array => [new TranslatorCollector()],
             'security' => static fn(): array => [new AuthorizationCollector()],
             'opentelemetry' => static fn(): array => [new OpenTelemetryCollector($timeline)],
+            'redis' => static fn(): array => [new RedisCollector($timeline)],
+            'elasticsearch' => static fn(): array => [new ElasticsearchCollector($timeline)],
+            'template' => static fn(): array => [new TemplateCollector($timeline)],
+            'code_coverage' => static fn(): array => [new CodeCoverageCollector($timeline, [], ['vendor'])],
         ];
     }
 
@@ -730,6 +784,12 @@ class Module extends \yii\base\Module implements BootstrapInterface
         if ($translatorCollector instanceof TranslatorCollector) {
             $this->registerTranslatorProfiling($app, $translatorCollector);
         }
+
+        // Register template profiling if TemplateCollector is active
+        $templateCollector = $this->getCollector(TemplateCollector::class);
+        if ($templateCollector instanceof TemplateCollector) {
+            $this->registerTemplateProfiling($templateCollector);
+        }
     }
 
     private function registerAuthorizationListeners(Application $app): void
@@ -752,7 +812,11 @@ class Module extends \yii\base\Module implements BootstrapInterface
             $listener,
         ): void {
             if ($app->has('user')) {
-                $listener->collectCurrentUser($app->getUser());
+                try {
+                    $listener->collectCurrentUser($app->getUser());
+                } catch (\Throwable) {
+                    // User component may not be fully configured (e.g. missing identityClass)
+                }
             }
         });
     }
@@ -920,6 +984,9 @@ class Module extends \yii\base\Module implements BootstrapInterface
     private function registerTranslatorProfiling(Application $app, TranslatorCollector $collector): void
     {
         $i18n = $app->getI18n();
+        if ($i18n === null) {
+            return;
+        }
         $proxy = new I18NProxy();
 
         // Copy existing translations config from the original I18N
@@ -974,6 +1041,40 @@ class Module extends \yii\base\Module implements BootstrapInterface
         \Yii::$app->log->targets['adp-debug'] = $target;
     }
 
+    private function registerTemplateProfiling(TemplateCollector $collector): void
+    {
+        // Track render start times using a stack to handle nested renders correctly.
+        // beginRender() creates a placeholder in parent-first order with correct depth.
+        // endRender() fills in output, params, and timing when the render completes.
+        $timers = [];
+
+        Event::on(
+            \yii\base\View::class,
+            \yii\base\View::EVENT_BEFORE_RENDER,
+            static function (\yii\base\ViewEvent $event) use ($collector, &$timers): void {
+                $timers[$event->viewFile][] = microtime(true);
+                $collector->beginRender($event->viewFile);
+            },
+        );
+
+        Event::on(
+            \yii\base\View::class,
+            \yii\base\View::EVENT_AFTER_RENDER,
+            static function (\yii\base\ViewEvent $event) use ($collector, &$timers): void {
+                $startTime = 0.0;
+                if (isset($timers[$event->viewFile]) && $timers[$event->viewFile] !== []) {
+                    $startTime = array_pop($timers[$event->viewFile]);
+                    if ($timers[$event->viewFile] === []) {
+                        unset($timers[$event->viewFile]);
+                    }
+                }
+
+                $renderTime = $startTime > 0 ? microtime(true) - $startTime : 0.0;
+                $collector->endRender($event->output, $event->params, $renderTime);
+            },
+        );
+    }
+
     /**
      * Wrap UrlManager rules with UrlRuleProxy to intercept route matching.
      *
@@ -1006,29 +1107,47 @@ class Module extends \yii\base\Module implements BootstrapInterface
             return;
         }
 
-        $app->getUrlManager()->addRules([
+        $app->getUrlManager()->addRules(
             [
-                'class' => \yii\web\UrlRule::class,
-                'pattern' => 'debug/api/<path:.*>',
-                'route' => 'debug-panel/adp-api/handle',
-                'defaults' => ['path' => ''],
+                // API routes (must be before the panel catch-all)
+                [
+                    'class' => \yii\web\UrlRule::class,
+                    'pattern' => 'debug/api/<path:.*>',
+                    'route' => 'debug-panel/adp-api/handle',
+                    'defaults' => ['path' => ''],
+                ],
+                [
+                    'class' => \yii\web\UrlRule::class,
+                    'pattern' => 'debug/api',
+                    'route' => 'debug-panel/adp-api/handle',
+                ],
+                [
+                    'class' => \yii\web\UrlRule::class,
+                    'pattern' => 'inspect/api/<path:.*>',
+                    'route' => 'debug-panel/adp-api/handle',
+                    'defaults' => ['path' => ''],
+                ],
+                [
+                    'class' => \yii\web\UrlRule::class,
+                    'pattern' => 'inspect/api',
+                    'route' => 'debug-panel/adp-api/handle',
+                ],
+                // Panel SPA routes (catch-all for client-side routing)
+                [
+                    'class' => \yii\web\UrlRule::class,
+                    'pattern' => 'debug/<path:(?!api(/|$)).+>',
+                    'route' => 'debug-panel/adp-api/handle',
+                    'defaults' => ['path' => ''],
+                    'verb' => ['GET'],
+                ],
+                [
+                    'class' => \yii\web\UrlRule::class,
+                    'pattern' => 'debug',
+                    'route' => 'debug-panel/adp-api/handle',
+                    'verb' => ['GET'],
+                ],
             ],
-            [
-                'class' => \yii\web\UrlRule::class,
-                'pattern' => 'debug/api',
-                'route' => 'debug-panel/adp-api/handle',
-            ],
-            [
-                'class' => \yii\web\UrlRule::class,
-                'pattern' => 'inspect/api/<path:.*>',
-                'route' => 'debug-panel/adp-api/handle',
-                'defaults' => ['path' => ''],
-            ],
-            [
-                'class' => \yii\web\UrlRule::class,
-                'pattern' => 'inspect/api',
-                'route' => 'debug-panel/adp-api/handle',
-            ],
-        ], false);
+            false,
+        );
     }
 }

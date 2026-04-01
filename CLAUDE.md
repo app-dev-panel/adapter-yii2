@@ -1,6 +1,6 @@
 # Yii 2 Adapter
 
-Bridges ADP Kernel and API into Yii 2. Third adapter after Yii 3 and Symfony.
+Bridges ADP Kernel and API into Yii 2. Third adapter after Yii 3 (Yii3) and Symfony.
 
 ## Package
 
@@ -35,7 +35,9 @@ src/
 │   ├── Yii2RouteAdapter.php                   # Wraps single UrlRule with __debugInfo()
 │   └── NullSchemaProvider.php                 # Fallback when no database configured
 └── Controller/
-    └── AdpApiController.php                   # Yii 2 controller bridging to ADP ApiApplication
+    ├── AdpApiController.php                   # Yii 2 controller bridging to ADP ApiApplication
+    ├── DebugQueryController.php               # Direct SQL query execution for inspector
+    └── DebugResetController.php               # Reset/clear debug storage
 ```
 
 ## How It Works
@@ -70,6 +72,10 @@ It registers the `debug-panel` module if enabled (auto-enables in YII_DEBUG mode
             'assets' => true,
             'translator' => true,
             'security' => true,
+            'redis' => true,
+            'elasticsearch' => true,
+            'template' => true,
+            'code_coverage' => false,
         ],
         'ignoredRequests' => ['/debug/api/**', '/inspect/api/**'],
         'ignoredCommands' => ['help', 'list', 'cache/*', 'asset/*'],
@@ -95,7 +101,7 @@ Executes in order:
 |---|---|
 | `Application::EVENT_BEFORE_REQUEST` | Convert Yii Request → PSR-7, `Debugger::startup()`, `RequestCollector`, `WebAppInfoCollector` |
 | `Application::EVENT_AFTER_REQUEST` | Convert Yii Response → PSR-7, `RequestCollector` captures response, adds `X-Debug-Id` header, `Debugger::shutdown()` |
-| `afterAction` | `ExceptionCollector` captures error handler exceptions |
+| `User::EVENT_AFTER_LOGIN` / `EVENT_AFTER_LOGOUT` | `AuthorizationListener` → `AuthorizationCollector` |
 
 **Console events (`ConsoleListener`):**
 
@@ -132,10 +138,24 @@ times internally and calls `DatabaseCollector::logQuery()` (from Kernel) on prof
 `Module::registerAssetProfiling()` hooks into (web only):
 - `yii\web\View::EVENT_END_PAGE` → `AssetBundleCollector::collectBundles()` (reads View::$assetBundles)
 
+### 6d. Template Profiling
+
+`Module::registerTemplateProfiling()` hooks into:
+- `yii\base\View::EVENT_BEFORE_RENDER` → records `microtime(true)` per `$viewFile` (using a stack for nested renders)
+- `yii\base\View::EVENT_AFTER_RENDER` → calculates render duration, calls `TemplateCollector::collectRender($viewFile, $output, $params, $renderTime)`
+- Captures timing, rendered output, and parameters in a single call
+- Uses a per-file timer stack to handle nested rendering correctly (layout → partial → widget)
+
+### 6e. Redis, Elasticsearch, Code Coverage
+
+`RedisCollector`, `ElasticsearchCollector`, and `CodeCoverageCollector` are registered in `buildCollectorMap()` and require no event wiring — they are fed data directly by application code or by the Kernel lifecycle (`startup()`/`shutdown()` for coverage).
+
+- `code_coverage` is opt-in (default: `false`), requires `pcov` or `xdebug` extension
+
 ### 7. Inspector Integration
 
 All inspector controllers are explicitly registered in `Module::registerServices()`.
-This follows the same pattern as Yiisoft and Symfony adapters (no auto-wiring for controllers).
+This follows the same pattern as Yii3 and Symfony adapters (no auto-wiring for controllers).
 
 **Registered controllers:**
 `FileController`, `RoutingController`, `InspectController`, `DatabaseController`,
@@ -163,8 +183,8 @@ Each `UrlRule` is wrapped in `Yii2RouteAdapter` exposing `__debugInfo()` with: n
 | Collector | Fed By | Data |
 |---|---|---|
 | `RequestCollector` | `WebListener` | PSR-7 request/response |
-| `LogCollector` | PSR-3 proxy (if configured) | PSR-3 log entries |
-| `EventCollector` | PSR-14 proxy (if configured) | Dispatched events |
+| `LogCollector` | `DebugLogTarget` (Yii log target) | Log entries captured in real-time |
+| `EventCollector` | Yii 2 global event listener (`Event::on('*', '*', ...)`) | Dispatched events |
 | `ExceptionCollector` | `WebListener` / `ConsoleListener` | Uncaught exceptions |
 | `HttpClientCollector` | PSR-18 proxy (if configured) | HTTP client requests |
 | `ServiceCollector` | — | Service method calls |
@@ -192,7 +212,10 @@ Each `UrlRule` is wrapped in `Yii2RouteAdapter` exposing `__debugInfo()` with: n
 | `AssetBundleCollector` | `View::EVENT_END_PAGE` (normalized in Module) | Asset bundles: class, source/base paths, CSS/JS files, dependencies |
 | `TranslatorCollector` | `I18NProxy` replacing `Yii::$app->i18n` | Translation lookups, missing translations |
 | `AuthorizationCollector` | `AuthorizationListener` on `User::EVENT_AFTER_LOGIN/LOGOUT` | Auth events: login, logout, user identity |
-| `RedisCollector` | `yii\redis\Connection` events or decorator | Redis commands, timing, errors |
+| `TemplateCollector` | `View::EVENT_BEFORE_RENDER` + `EVENT_AFTER_RENDER` | Render timing, output, parameters (nested-safe) |
+| `RedisCollector` | Direct collector calls | Redis commands, timing, errors |
+| `ElasticsearchCollector` | Direct collector calls | ES requests, timing, hits |
+| `CodeCoverageCollector` | `pcov` / `xdebug` lifecycle | Per-file line coverage (opt-in) |
 
 ## Architecture Comparison: Symfony vs Yii 2
 
